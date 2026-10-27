@@ -1329,6 +1329,26 @@ int ObAIFuncUtils::get_ai_func_info(ObIAllocator &allocator, const ObString &mod
   return ret;
 }
 
+// A completion response is only usable when it carries non-empty content.
+// Providers return the message content node; treat a missing node, an explicit
+// JSON null, or an empty string as an abnormal response so callers surface a
+// clear error instead of an empty/"null" result.
+static bool is_empty_completion_result(const ObIJsonBase *result_base)
+{
+  bool is_empty = true;
+  if (OB_NOT_NULL(result_base)) {
+    const ObJsonNodeType type = result_base->json_type();
+    if (type == ObJsonNodeType::J_NULL) {
+      is_empty = true;
+    } else if (type == ObJsonNodeType::J_STRING) {
+      is_empty = (result_base->get_data_length() == 0);
+    } else {
+      is_empty = false;
+    }
+  }
+  return is_empty;
+}
+
 int ObAIFuncModel::call_completion(ObString &prompt, ObJsonObject *config, ObString &result)
 {
   int ret = OB_SUCCESS;
@@ -1351,6 +1371,9 @@ int ObAIFuncModel::call_completion(ObString &prompt, ObJsonObject *config, ObStr
   } else if (OB_FAIL(complete_provider->get_body(*allocator_, request_model_name, prompt_str, prompt, config, body))) {
   } else if (OB_FAIL(client.send_post(*allocator_, endpoint_info_.get_url(), headers, body, response))) {
   } else if (OB_FAIL(complete_provider->parse_output(*allocator_, response, result_base))) {
+  } else if (is_empty_completion_result(result_base)) {
+    ret = OB_INVALID_DATA;
+    LOG_WARN("ai_complete got empty response content", K(ret));
   } else if (OB_FAIL(ObAIFuncJsonUtils::print_json_to_str(*allocator_, result_base, result_str))) {
   } else {
     result = result_str;
@@ -1405,11 +1428,17 @@ int ObAIFuncModel::call_completion_vector(ObArray<ObString> &prompts, ObJsonObje
       ObJsonObject *response = response_array[i];
       ObStringBuffer result_buf(allocator_);
       if (OB_FAIL(complete_provider->parse_output(*allocator_, response, result_base))) {
+      } else if (is_empty_completion_result(result_base)) {
+        ret = OB_INVALID_DATA;
+        LOG_WARN("ai_complete got empty response content", K(ret), K(i));
       } else if (OB_FAIL(result_base->print(result_buf, 0))) {
       } else {
         results.push_back(result_buf.string());
       }
     }
+  }
+  if (ret == OB_INVALID_DATA) {
+    FORWARD_USER_ERROR(ret, "unexpected http message");
   }
   return ret;
 }
