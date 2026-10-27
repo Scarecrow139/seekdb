@@ -229,21 +229,55 @@ int ObOpenAIUtils::ObOpenAIEmbed::parse_output(common::ObIAllocator &allocator,
     if (OB_FAIL(ObAIFuncJsonUtils::get_json_array(allocator, result_array))) {
     } else if (OB_ISNULL(data_node = http_response->get_value("data"))) {
       ret = OB_INVALID_DATA;
+    } else if (data_node->json_type() != ObJsonNodeType::J_ARRAY) {
+      ret = OB_INVALID_DATA;
     } else {
+      // The OpenAI embedding response carries an "index" per element and the
+      // service may return them out of order. Collect the embeddings together
+      // with their declared index, then restore input order by a stable sort so
+      // results always align with the request rows.
       ObJsonArray *data_array = static_cast<ObJsonArray *>(data_node);
-      ObJsonNode *embedding_node = nullptr;
-      for (int64_t i = 0; OB_SUCC(ret) && i < data_array->element_count(); i++) {
-        if (OB_ISNULL(embedding_node = data_array->get_value(i))) {
+      const int64_t count = data_array->element_count();
+      ObArray<ObJsonNode *> embeddings;
+      ObArray<int64_t> indexes;
+      ObArray<int64_t> order;
+      for (int64_t i = 0; OB_SUCC(ret) && i < count; i++) {
+        ObJsonNode *embedding_node = data_array->get_value(i);
+        ObJsonObject *embedding_obj = nullptr;
+        ObJsonNode *embedding = nullptr;
+        ObJsonNode *index_node = nullptr;
+        int64_t idx = i;
+        if (OB_ISNULL(embedding_node) || embedding_node->json_type() != ObJsonNodeType::J_OBJECT) {
           ret = OB_INVALID_DATA;
-        } else if (embedding_node->json_type() != ObJsonNodeType::J_OBJECT) {
+        } else if (OB_ISNULL(embedding_obj = static_cast<ObJsonObject *>(embedding_node))) {
+          ret = OB_INVALID_DATA;
+        } else if (OB_ISNULL(embedding = embedding_obj->get_value("embedding"))) {
           ret = OB_INVALID_DATA;
         } else {
-          ObJsonObject *embedding_obj = static_cast<ObJsonObject *>(embedding_node);
-          ObJsonNode *embedding = embedding_obj->get_value("embedding");
-          if (OB_ISNULL(embedding)) {
-            ret = OB_INVALID_DATA;
-          } else if (OB_FAIL(result_array->append(embedding))) {
+          index_node = embedding_obj->get_value("index");
+          if (OB_NOT_NULL(index_node) && index_node->json_type() == ObJsonNodeType::J_INT) {
+            idx = static_cast<ObJsonInt *>(index_node)->get_int();
           }
+          if (idx < 0 || idx >= count) {
+            ret = OB_INVALID_DATA;
+          } else if (OB_FAIL(embeddings.push_back(embedding))) {
+          } else if (OB_FAIL(indexes.push_back(idx))) {
+          } else if (OB_FAIL(order.push_back(i))) {
+          }
+        }
+      }
+      // stable insertion sort of positions by their declared index
+      for (int64_t i = 1; OB_SUCC(ret) && i < count; i++) {
+        int64_t key = order.at(i);
+        int64_t j = i - 1;
+        while (j >= 0 && indexes.at(order.at(j)) > indexes.at(key)) {
+          order.at(j + 1) = order.at(j);
+          j--;
+        }
+        order.at(j + 1) = key;
+      }
+      for (int64_t i = 0; OB_SUCC(ret) && i < count; i++) {
+        if (OB_FAIL(result_array->append(embeddings.at(order.at(i))))) {
         }
       }
       if (OB_SUCC(ret)) {
@@ -258,7 +292,15 @@ int ObOllamaUtils::get_header(common::ObIAllocator &allocator,
                               common::ObArray<ObString> &headers) 
 {
   int ret = OB_SUCCESS;
-  // ollama header is empty, do nothing
+  // Ollama needs no Authorization header, but the request body is JSON and the
+  // HTTP client rejects an empty header set, so always send the content type.
+  ObString content_type_str("Content-Type: application/json");
+  ObString content_type_c_str;
+  if (OB_FAIL(ob_write_string(allocator, content_type_str, content_type_c_str, true))) {
+    LOG_WARN("failed to write content type header", K(ret));
+  } else if (OB_FAIL(headers.push_back(content_type_c_str))) {
+    LOG_WARN("failed to push back content type header", K(ret));
+  }
   return ret;
 }
 
@@ -280,15 +322,18 @@ int ObOllamaUtils::ObOllamaComplete::get_body(common::ObIAllocator &allocator,
   if (model.empty() || content.empty()) { 
     ret = OB_INVALID_ARGUMENT;
   } else {
-    // {"model": "llama3.1", "prompt": "What is the capital of France?"}
+    // {"model": "llama3.1", "prompt": "What is the capital of France?", "stream": false}
     ObJsonObject *body_obj = nullptr;
     ObJsonString *model_str = nullptr;
     ObJsonString *content_str = nullptr;
+    ObJsonBoolean *stream_obj = nullptr;
     if (OB_FAIL(ObAIFuncJsonUtils::get_json_object(allocator, body_obj))) {
     } else if (OB_FAIL(ObAIFuncJsonUtils::get_json_string(allocator, model, model_str))) {
     } else if (OB_FAIL(body_obj->add("model", model_str))) {
     } else if (OB_FAIL(ObAIFuncJsonUtils::get_json_string(allocator, content, content_str))) {
     } else if (OB_FAIL(body_obj->add("prompt", content_str))) {
+    } else if (OB_FAIL(ObAIFuncJsonUtils::get_json_boolean(allocator, false, stream_obj))) {
+    } else if (OB_FAIL(body_obj->add("stream", stream_obj))) {
     } else if (OB_FAIL(ObAIFuncJsonUtils::compact_json_object(allocator, config, body_obj))) {
     } else {
       body = body_obj;
@@ -1063,6 +1108,8 @@ int ObAIFuncUtils::get_complete_provider(ObIAllocator &allocator, const ObString
     complete_provider = OB_NEWx(ObOpenAIUtils::ObOpenAIComplete, &allocator);
   } else if (ob_provider_check(provider, ObAIFuncProviderUtils::DASHSCOPE)) {
     complete_provider = OB_NEWx(ObDashscopeUtils::ObDashscopeComplete, &allocator);
+  } else if (ob_provider_check(provider, ObAIFuncProviderUtils::OLLAMA)) {
+    complete_provider = OB_NEWx(ObOllamaUtils::ObOllamaComplete, &allocator);
   } else {
     ret = OB_NOT_SUPPORTED;
     LOG_USER_ERROR(OB_NOT_SUPPORTED, "this provider current is");
@@ -1086,6 +1133,8 @@ int ObAIFuncUtils::get_embed_provider(ObIAllocator &allocator, const ObString &p
     embed_provider = OB_NEWx(ObOpenAIUtils::ObOpenAIEmbed, &allocator);
   } else if (ob_provider_check(provider, ObAIFuncProviderUtils::DASHSCOPE)) {
     embed_provider = OB_NEWx(ObDashscopeUtils::ObDashscopeEmbed, &allocator);
+  } else if (ob_provider_check(provider, ObAIFuncProviderUtils::OLLAMA)) {
+    embed_provider = OB_NEWx(ObOllamaUtils::ObOllamaEmbed, &allocator);
   } else {
     ret = OB_NOT_SUPPORTED;
     LOG_USER_ERROR(OB_NOT_SUPPORTED, "this provider current is");
@@ -1616,19 +1665,35 @@ int ObAIFuncPromptObjectUtils::replace_all_str_args_in_template(ObIAllocator &al
     ret = OB_INVALID_ARGUMENT;
   } else {
     uint64_t args_count = args_array->element_count();
-    int64_t max_result_len = template_str.length();
+    int64_t tpl_len = template_str.length();
+    int64_t max_arg_len = 0;
+    int64_t num_braces = 0;
     char *result_buf = NULL;
     for (uint64_t i = 0; OB_SUCC(ret) && i < args_count; i++) {
       ObJsonNode *arg_node = args_array->get_value(i);
       if (OB_NOT_NULL(arg_node) && arg_node->json_type() == ObJsonNodeType::J_STRING) {
         ObJsonString *arg_str = static_cast<ObJsonString *>(arg_node);
-        max_result_len += arg_str->get_str().length();
+        int64_t arg_len = arg_str->get_str().length();
+        if (arg_len > max_arg_len) {
+          max_arg_len = arg_len;
+        }
       } else {
         ret = OB_INVALID_ARGUMENT;
       }
     }
+    // A placeholder may repeat in the template and each occurrence expands
+    // independently, so budget for the worst case: every '{' is replaced by the
+    // longest argument. The old single-count budget overflowed on repeats.
+    const char *tpl_ptr = template_str.ptr();
+    for (int64_t i = 0; i < tpl_len; i++) {
+      if (tpl_ptr[i] == '{') {
+        num_braces++;
+      }
+    }
+    int64_t max_result_len = tpl_len + num_braces * max_arg_len;
     if (OB_FAIL(ret)) {
-    } else if (OB_ISNULL(result_buf = static_cast<char *>(allocator.alloc(max_result_len)))) {
+    } else if (max_result_len <= 0
+               || OB_ISNULL(result_buf = static_cast<char *>(allocator.alloc(max_result_len)))) {
       ret = OB_ALLOCATE_MEMORY_FAILED;
     } else {
       int64_t result_pos = 0;
