@@ -7,9 +7,10 @@ connection default;
 # 正确
 select ai_prompt('{0}+{1}={2} 吗？请回答true或false','1');
 
-# not support
---error 1235 
+# json object / json array 参数：结构化嵌入到 args 数组
 select ai_prompt('{0}+{1}={2} 吗？请回答true或false',json_object("a","1"));
+select ai_prompt('{0}',json_array("a","b"));
+select ai_prompt('{0}{1}',json_object("a","1"),json_array(1,2));
 
 
 # 无参数
@@ -48,8 +49,8 @@ select ai_prompt(c) from t1;
 drop table t1;
 
 
-# 表达式不支持的类型 
-# test  text/blob
+# 表达式类型：数值类型不支持，text/blob（TEXT/LONGTEXT 等 LOB）现已支持
+# test  int / text / blob
 --disable_warnings
 drop table if exists t1;
 --enable_warnings
@@ -62,14 +63,12 @@ insert into t1 values(7, 'AA', 'bb', 'CC', 'dd');
 
 --error 5083
 select ai_prompt(nr) from t1;
---error 5083
-select ai_prompt(a) from t1;
---error 5083
-select ai_prompt(b) from t1;
---error 5083
-select ai_prompt(c) from t1;
---error 5083
-select ai_prompt(d) from t1;
+# text/blob 列作为模板与参数均支持（LOB-aware 读取）
+select ai_prompt(a) from t1 order by nr;
+select ai_prompt(b) from t1 order by nr;
+select ai_prompt(c) from t1 order by nr;
+select ai_prompt(d) from t1 order by nr;
+select ai_prompt(b, d) from t1 order by nr;
 
 drop table t1;
 
